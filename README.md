@@ -22,13 +22,13 @@
 > [!IMPORTANT]
 > **Bring your own game.**
 >
-> Dark Emblem contains **no game data, no keys, and no precompiled game binary**, and it will not tell you where to get them. Everything is built locally on your PC from your own legally obtained Switch 2 copy, and everything it produces (the compiled binary, packed game data, shader caches, and saves) stays on your machine. **Do not share those files.**
+> Dark Emblem contains **no game data and no precompiled game binary**, and it will not tell you where to get them. Everything is built locally on your PC from your own legally obtained Switch 2 copy, and everything it produces (the compiled binary, packed game data, shader caches, and saves) stays on your machine. **Do not share those files.**
 
 ---
 
 ## Overview
 
-**Dark Emblem** translates your own unencrypted Switch 2 backup (`v1.2.0 / 131072`) locally into a standalone native Windows x86-64 installation — running directly on your CPU and Vulkan 1.3 GPU without runtime JIT overhead.
+**Dark Emblem** translates your own Switch 2 backup (`v1.2.0 / 131072`) locally into a standalone native Windows x86-64 installation — running directly on your CPU and Vulkan 1.3 GPU without runtime JIT overhead.
 
 - **Native x86-64 Recompilation:** Translates ARM64 code directly into native AVX2/FMA x86-64 machine code (`bin/game.dll`) linked against a hardened closed-source runtime (`bin/engine.dll`).
 - **Zero Developer Tools Needed:** On first setup, `Launcher.exe` automatically downloads a slim, SHA-256 verified portable LLVM archive (`toolchain-win64.zip`, ~62 MB) to compile your binary locally, then automatically removes all temporary build files. **No Visual Studio or Windows SDK required.**
@@ -69,10 +69,10 @@
 
 ## Supported Backup Formats
 
-Dark Emblem supports **unencrypted Switch 2 backups only** (no decryption keys / `prod.keys` and no Switch 1 `.nsp`/`.xci` formats apply):
+Dark Emblem accepts standard Switch 2 backup formats (`v1.2.0 / 131072`, base + update without DLC):
 
 - **`.nup` Container** (`NUP\x01` v1 — raw or Zstandard-compressed, base or base+update packages)
-- **Decrypted Folder** containing `exefs/` and `romfs/` (selecting the parent folder containing `131072/exefs` + `131072/romfs` is also auto-detected)
+- **Unpacked Folder** containing `exefs/` and `romfs/` (selecting the parent folder containing `131072/exefs` + `131072/romfs` is also auto-detected)
 
 ---
 
