@@ -1,0 +1,19 @@
+Dark Emblem — Proprietary Binary License
+Copyright (c) 2026 Dark Emblem Contributors. All Rights Reserved.
+
+Permission is granted to download and run the unmodified official binary
+distribution of Dark Emblem for personal, non-commercial use on your own
+hardware with your own legally obtained backup.
+
+Redistribution of modified binaries, reverse engineering, decompilation,
+or distribution of any user-generated game-derived outputs (including
+compiled game.dll, packed RomFS data, shader caches, or extracted assets)
+is strictly prohibited.
+
+Third-party open-source and SDK components included with Dark Emblem remain
+subject to their respective permissive and vendor licenses as listed in
+THIRD_PARTY_NOTICES.txt.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
