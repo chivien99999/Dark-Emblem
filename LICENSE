@@ -1,18 +1,39 @@
-Dark Emblem — Proprietary Binary License
+Dark Emblem — Source-Available Front-End & Proprietary Core License
 Copyright (c) 2026 Dark Emblem Contributors. All Rights Reserved.
 
-Permission is granted to download and run the unmodified official binary
-distribution of Dark Emblem for personal, non-commercial use on your own
-hardware with your own legally obtained backup.
+1. Desktop Front-End Source Code (apps/ — Launcher, Play, Settings)
+   The source code under apps/ is published as source-available for public
+   security inspection, verification, and personal compilation.
 
-Redistribution of modified binaries, reverse engineering, decompilation,
-or distribution of any user-generated game-derived outputs (including
-compiled game.dll, packed RomFS data, shader caches, or extracted assets)
-is strictly prohibited.
+   Permission is granted to:
+     - Read, audit, and verify the source code in apps/.
+     - Compile apps/ locally on your own machine for personal, non-commercial
+       use with your own official Dark Emblem installation.
 
-Third-party open-source and SDK components included with Dark Emblem remain
-subject to their respective permissive and vendor licenses as listed in
-THIRD_PARTY_NOTICES.txt.
+   All other rights are strictly reserved. Without prior written permission
+   from the copyright holder, you may NOT:
+     - Redistribute, re-upload, rebrand, or publish copies or modified builds
+       of this code or its compiled binaries.
+     - Use this code in any other project, derivative distribution, or
+       commercial / monetized offering (including Patreon, paid builds, or
+       ad-supported re-uploads).
+
+2. Proprietary Core Runtime & Tools (bin/*)
+   The compiled core runtime and recompiler binaries distributed in official
+   releases (engine.dll, recompiler.exe, nup_tool.exe, shobjpack.exe,
+   hz_romfs_pack.exe, bc7cache.exe) are closed-source proprietary software.
+
+   Permission is granted to download and run the unmodified official binary
+   distribution for personal, non-commercial use on your own hardware with
+   your own legally obtained backup. Redistribution of modified binaries,
+   reverse engineering, decompilation, or distribution of any user-generated
+   game-derived outputs (including compiled game.dll, packed RomFS data,
+   shader caches, or extracted assets) is strictly prohibited.
+
+3. Third-Party Components
+   Third-party open-source and SDK components included with Dark Emblem remain
+   subject to their respective permissive and vendor licenses as listed in
+   THIRD_PARTY_NOTICES.txt.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

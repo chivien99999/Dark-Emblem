@@ -97,9 +97,17 @@ Dark Emblem accepts standard Switch 2 backup formats (`v1.2.0 / 131072`, base + 
 
 ---
 
-## License & Third-Party Software
+## License, Security Verification & Third-Party Software
 
-Dark Emblem's runtime, recompiler, and launcher are **closed-source proprietary software** written from scratch (`All Rights Reserved` — see [LICENSE](LICENSE)).
+### Open-Auditable Front-End (`apps/`)
+The complete source code for all three desktop applications you run directly — **`Launcher.exe`** ([apps/launcher/launcher.cpp](apps/launcher/launcher.cpp)), **`Play.exe`** ([apps/play/play_stub.c](apps/play/play_stub.c)), and **`Settings.exe`** ([apps/settings/settings_app.c](apps/settings/settings_app.c)) — is published in this repository under a **Source-Available Audit & Personal Build License** ([LICENSE](LICENSE)) so anyone can inspect every network request (SHA-256 verified toolchain fetch), file access, and process launch, or build all three executables locally with zero external SDKs:
+
+```powershell
+cmake -S apps -B build-apps
+cmake --build build-apps --config Release
+```
+
+The core static recompiler, Vulkan 1.3 renderer, shader compiler, and runtime (`bin/engine.dll`, `bin/recompiler.exe`, `bin/nup_tool.exe`, `bin/shobjpack.exe`, `bin/hz_romfs_pack.exe`, `bin/bc7cache.exe`) remain **closed-source proprietary software** (`All Rights Reserved` — see [LICENSE](LICENSE)).
 
 Third-party permissively licensed open-source libraries (SDL3, dav1d, Opus, Zstandard, astcenc, bc7enc, xxHash, Vulkan-Headers, AMD FidelityFX SDK, Capstone, LZ4, LLVM) and vendor-redistributable SDK components (NVIDIA DLSS / Streamline) are credited in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt). Zero GPL or LGPL components are included.
 
