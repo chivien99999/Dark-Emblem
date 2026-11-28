@@ -128,7 +128,7 @@ static void probe(Caps *c) {
 
 enum { ID_UP_AUTO = 100, ID_UP_DLSS, ID_UP_FSR3, ID_UP_OFF, ID_QUALITY = 110, ID_OUTPUT, ID_OUT_W, ID_OUT_H, ID_WIN_WINDOWED = 120, ID_WIN_BORDERLESS,
        ID_SHARP = 130, ID_SHARP_VAL, ID_PRESET, ID_SAVE = 140, ID_PLAY, ID_CLOSE, ID_STATUS = 150, ID_RESOLVED, ID_HDR_WHITE_AUTO = 160, ID_HDR_WHITE, ID_HDR_PEAK_AUTO, ID_HDR_PEAK, ID_FRAMEGEN = 170, ID_FPS, ID_REFLEX,
-       ID_TEXCOMP = 180, ID_TEXDESC, ID_TEXDETAIL, ID_DETDESC, ID_SHADERLOAD = 190, ID_SHDDESC };
+       ID_TEXCOMP = 180, ID_TEXDESC, ID_TEXDETAIL, ID_DETDESC, ID_SHADERLOAD = 190, ID_SHDDESC, ID_DETWARN = 195 };
 static HWND g_wnd; static HFONT g_font; static LnUserSettings g_set; static char g_path[MAX_PATH * 2];
 static char g_requested_path[MAX_PATH * 2]; 
 static const struct { const char *label; uint32_t w, h; int kind; } k_out[] = {
@@ -226,7 +226,20 @@ static void refresh(void) {
             snprintf(yours, sizeof yours, " This card: %.1f GB, so %s.", (double)g_caps.vram / 1073741824.0, k_det_label[res]);
         char td[512];
         snprintf(td, sizeof td, "%s%s Applies the next time the game starts.", dc >= 0 && dc < LN_SET_DETAIL_COUNT ? k_det_desc[dc] : "", yours);
-        SetWindowTextA(item(ID_DETDESC), td); }
+        SetWindowTextA(item(ID_DETDESC), td);
+        LnSetTexDetail rec = LN_SET_DETAIL_HIGH;
+        if (g_caps.vram) (void)ln_settings_tex_detail_drop(LN_SET_DETAIL_AUTO, g_caps.vram, &rec);
+        const uint64_t ram_mib = ln_host_ram_mib();
+        if (ram_mib > 0 && ram_mib <= 16896u && rec < LN_SET_DETAIL_LOW) rec = LN_SET_DETAIL_LOW;
+        if (dc >= LN_SET_DETAIL_HIGH && dc < LN_SET_DETAIL_COUNT && (int)dc < (int)rec) {
+            char warn[256];
+            snprintf(warn, sizeof warn,
+                     "Warning: Exceeds recommended Auto tier (%s) for your GPU/RAM - texture cache will be clamped for safety; use Auto if you see hitching.",
+                     k_det_label[rec]);
+            SetWindowTextA(item(ID_DETWARN), warn);
+        } else {
+            SetWindowTextA(item(ID_DETWARN), "");
+        } }
     {   const LRESULT sc = SendMessageA(item(ID_SHADERLOAD), CB_GETCURSEL, 0, 0);
         char yours[128] = "";
         if (sc == LN_SET_SHADER_AUTO && g_caps.vram) {
@@ -427,7 +440,8 @@ static void build(void) {
     HWND dcb = mk("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 170, y, 240, 200, ID_TEXDETAIL);
     for (int i = 0; i < LN_SET_DETAIL_COUNT; i++) SendMessageA(dcb, CB_ADDSTRING, 0, (LPARAM)k_det_label[i]);
     y += 30;
-    mk("STATIC", "", SS_LEFT, 12, y, 456, 50, ID_DETDESC); y += 56;
+    mk("STATIC", "", SS_LEFT, 12, y, 456, 50, ID_DETDESC); y += 52;
+    mk("STATIC", "", SS_LEFT, 12, y, 456, 34, ID_DETWARN); y += 40;
     mk("STATIC", "Shader loading:", SS_LEFT, 12, y + 4, 150, 20, 0);
     HWND scb = mk("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 170, y, 240, 200, ID_SHADERLOAD);
     for (int i = 0; i < LN_SET_SHADER_COUNT; i++) SendMessageA(scb, CB_ADDSTRING, 0, (LPARAM)k_shd_label[i]);
@@ -476,7 +490,12 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
         DrawTextA(di->hDC, text, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX); SelectObject(di->hDC, old);
         if (di->itemState & ODS_FOCUS) DrawFocusRect(di->hDC, &di->rcItem);
         return TRUE; }
-    case WM_CTLCOLORSTATIC: { HDC dc = (HDC)w; SetBkMode(dc, TRANSPARENT); return (LRESULT)GetSysColorBrush(COLOR_BTNFACE); }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)w;
+        SetBkMode(dc, TRANSPARENT);
+        if ((HWND)l == item(ID_DETWARN)) SetTextColor(dc, RGB(180, 55, 0));
+        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+    }
     case WM_DESTROY: PostQuitMessage(0); return 0;
     }
     return DefWindowProcA(h, m, w, l);
@@ -602,7 +621,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show) {
         .hIconSm = hIco ? hIco : LoadIcon(NULL, IDI_APPLICATION)
     };
     RegisterClassExA(&wc);
-    RECT rc = { 0, 0, 480, 480 + 38 + 134 + 36 + 36 + 28 + 86 + 86 + 86 };
+    RECT rc = { 0, 0, 480, 480 + 38 + 134 + 36 + 36 + 28 + 86 + 86 + 86 + 36 };
     AdjustWindowRect(&rc, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     g_wnd = CreateWindowExA(0, wc.lpszClassName, "Dark Emblem — Graphics Settings",
                             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
