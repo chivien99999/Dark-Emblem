@@ -584,10 +584,15 @@ static void run_recompiler_async(LauncherApp &app, const std::wstring &mode_arg,
             return;
         }
 
-        std::wstring cmd = L"\"" + recomp + L"\" --mode " + mode_arg +
-                           L" --install-root \"" + app.install_root + L"\"";
+        auto quote_arg = [](std::wstring s) -> std::wstring {
+            while (s.size() > 3 && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+            if (!s.empty() && s.back() == L'\\') s.push_back(L'\\'); // escape drive-root trailing backslash before closing quote
+            return L"\"" + s + L"\"";
+        };
+        std::wstring cmd = quote_arg(recomp) + L" --mode " + mode_arg +
+                           L" --install-root " + quote_arg(app.install_root);
         if (mode_arg == L"install") {
-            cmd += L" --input \"" + input_copy + L"\" --toolchain \"" + tc_dir + L"\"";
+            cmd += L" --input " + quote_arg(input_copy) + L" --toolchain " + quote_arg(tc_dir);
             if (bc7_copy) cmd += L" --bc7";
         }
 
@@ -658,10 +663,16 @@ static void run_recompiler_async(LauncherApp &app, const std::wstring &mode_arg,
         WaitForSingleObject(pi.hProcess, INFINITE);
         DWORD rc = 1;
         GetExitCodeProcess(pi.hProcess, &rc);
-        if (rc != 0 && !app.cancel_req.load() && !full_log.empty()) {
+        if (rc != 0 && !app.cancel_req.load()) {
             std::wstring log_path = app.install_root + L"\\setup.log";
             FILE *lf = _wfopen(log_path.c_str(), L"wb");
-            if (lf) { fwrite(full_log.data(), 1, full_log.size(), lf); fclose(lf); }
+            if (lf) {
+                char hdr[256];
+                snprintf(hdr, sizeof(hdr), "exit_code=%lu (0x%08lX)\r\n", (unsigned long)rc, (unsigned long)rc);
+                fwrite(hdr, 1, strlen(hdr), lf);
+                if (!full_log.empty()) fwrite(full_log.data(), 1, full_log.size(), lf);
+                fclose(lf);
+            }
         }
         {
             std::lock_guard<std::mutex> lk(app.mtx);
@@ -669,7 +680,9 @@ static void run_recompiler_async(LauncherApp &app, const std::wstring &mode_arg,
             if (app.cancel_req.load()) {
                 app.last_error = L"Operation cancelled.";
             } else if (rc != 0) {
-                std::string shown = !err_msg.empty() ? err_msg : (!last_line.empty() ? last_line : "Setup failed. Verify free disk space (~40 GB) and valid target backup.");
+                char fallback[160];
+                snprintf(fallback, sizeof(fallback), "Setup failed (exit 0x%08lX). Check setup.log and antivirus/free space.", (unsigned long)rc);
+                std::string shown = !err_msg.empty() ? err_msg : (!last_line.empty() ? last_line : fallback);
                 app.last_error = utf8_to_w(shown);
             }
         }
