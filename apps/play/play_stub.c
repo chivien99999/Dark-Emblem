@@ -5,6 +5,10 @@
 #include <windows.h>
 #include <stdint.h>
 
+// Prefer discrete GPU on NVIDIA Optimus / AMD PowerXpress hybrid-graphics laptops.
+__declspec(dllexport) unsigned long NvOptimusEnablement = 0x00000001;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+
 typedef int (*de_engine_run_fn)(const void *reserved, uint32_t flags, const wchar_t *install_root);
 #define DE_ENGINE_RUN_SYM "de_70acf276"
 

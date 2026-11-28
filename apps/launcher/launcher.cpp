@@ -15,6 +15,7 @@
 #include <commdlg.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <atomic>
@@ -73,6 +74,7 @@ struct LauncherApp {
     IDWriteTextFormat *tf_head = nullptr;
     IDWriteTextFormat *tf_body = nullptr;
     IDWriteTextFormat *tf_small = nullptr;
+    IDWriteTextFormat *tf_err = nullptr;
     IDWriteTextFormat *tf_btn = nullptr;
     IDWriteTextFormat *tf_btn_big = nullptr;
 
@@ -80,6 +82,8 @@ struct LauncherApp {
     std::wstring gpu_name = L"Detecting GPU...";
     std::wstring settings_summary = L"Default (Auto Upscaler / Native)";
     bool has_bc7 = false;
+    bool is_installed = false;
+    bool force_setup = false;
 
     UiMode mode = UiMode::Setup;
     std::wstring selected_input;
@@ -98,6 +102,7 @@ struct LauncherApp {
     std::atomic<bool> worker_running{false};
     std::atomic<bool> cancel_req{false};
     HANDLE child_proc = NULL;
+    HANDLE child_job = NULL;
     uint64_t install_start_ms = 0;
 
     // Hover state
@@ -119,6 +124,7 @@ enum {
     BTN_CHECK_BC7 = 3,
     BTN_START_INSTALL = 4,
     BTN_CANCEL_INSTALL = 5,
+    BTN_BACK_HUB = 6,
     BTN_PLAY = 10,
     BTN_SETTINGS = 11,
     BTN_REBUILD_SHADERS = 12,
@@ -156,17 +162,139 @@ static bool dir_exists(const std::wstring &p) {
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
+static std::wstring quote_arg(std::wstring s) {
+    while (s.size() > 3 && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
+    std::wstring out = L"\"";
+    size_t bs = 0;
+    for (wchar_t ch : s) {
+        if (ch == L'\\') {
+            bs++;
+        } else if (ch == L'"') {
+            out.append(bs * 2 + 1, L'\\');
+            out.push_back(L'"');
+            bs = 0;
+        } else {
+            out.append(bs, L'\\');
+            bs = 0;
+            out.push_back(ch);
+        }
+    }
+    out.append(bs * 2, L'\\');
+    out.push_back(L'"');
+    return out;
+}
+
+static bool toolchain_valid(const std::wstring &dir) {
+    return file_exists(dir + L"\\bin\\clang-cl.exe") &&
+           file_exists(dir + L"\\bin\\lld-link.exe") &&
+           file_exists(dir + L"\\lib\\clang_rt.builtins-x86_64.lib") &&
+           file_exists(dir + L"\\include\\stddef.h");
+}
+
+static void remove_dir_recursive(const std::wstring &dir) {
+    if (!dir_exists(dir)) return;
+    WIN32_FIND_DATAW fd{};
+    HANDLE hf = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (hf != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            std::wstring child = dir + L"\\" + fd.cFileName;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                remove_dir_recursive(child);
+            } else {
+                SetFileAttributesW(child.c_str(), FILE_ATTRIBUTE_NORMAL);
+                DeleteFileW(child.c_str());
+            }
+        } while (FindNextFileW(hf, &fd));
+        FindClose(hf);
+    }
+    SetFileAttributesW(dir.c_str(), FILE_ATTRIBUTE_NORMAL);
+    RemoveDirectoryW(dir.c_str());
+}
+
+static HANDLE create_kill_job() {
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    if (!job) return NULL;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};
+    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli))) {
+        CloseHandle(job);
+        return NULL;
+    }
+    return job;
+}
+
+static void terminate_active_children(LauncherApp &app) {
+    std::lock_guard<std::mutex> lk(app.mtx);
+    if (app.child_job) {
+        TerminateJobObject(app.child_job, 1);
+        CloseHandle(app.child_job);
+        app.child_job = NULL;
+    }
+    if (app.child_proc) {
+        TerminateProcess(app.child_proc, 1);
+    }
+}
+
+static bool cpu_supports_x86_64_v3() {
+    int r[4] = {};
+    __cpuid(r, 0);
+    if (r[0] < 7) return false;
+    __cpuid(r, 1);
+    const bool osxsave = (r[2] & (1 << 27)) != 0;
+    const bool avx     = (r[2] & (1 << 28)) != 0;
+    const bool fma     = (r[2] & (1 << 12)) != 0;
+    if (!osxsave || !avx || !fma) return false;
+    const unsigned long long xcr0 = _xgetbv(0);
+    if ((xcr0 & 0x6ull) != 0x6ull) return false;
+    __cpuidex(r, 7, 0);
+    const bool avx2 = (r[1] & (1 << 5)) != 0;
+    const bool bmi2 = (r[1] & (1 << 8)) != 0;
+    return avx2 && bmi2;
+}
+
+static bool preflight_check(const LauncherApp &app, std::wstring &out_err) {
+    if (!cpu_supports_x86_64_v3()) {
+        out_err = L"Unsupported CPU: AVX2, FMA, and BMI2 instructions are required (Intel Haswell 4th-gen / AMD Excavator or newer).";
+        return false;
+    }
+    HMODULE vk = LoadLibraryW(L"vulkan-1.dll");
+    if (!vk) {
+        out_err = L"No Vulkan 1.3 graphics driver found (vulkan-1.dll missing). Please install or update your GPU drivers.";
+        return false;
+    }
+    FreeLibrary(vk);
+
+    const uint64_t need_gb = app.input_is_nup ? 55ull : 32ull;
+    ULARGE_INTEGER free_avail{};
+    if (GetDiskFreeSpaceExW(app.install_root.c_str(), &free_avail, NULL, NULL)) {
+        if (free_avail.QuadPart < (need_gb << 30)) {
+            wchar_t msg[256];
+            double avail_gb = (double)free_avail.QuadPart / (1024.0 * 1024.0 * 1024.0);
+            swprintf_s(msg, L"Not enough free disk space: %.1f GB available, at least %llu GB required for %s setup.",
+                       avail_gb, (unsigned long long)need_gb, app.input_is_nup ? L".nup" : L"folder");
+            out_err = msg;
+            return false;
+        }
+    }
+    return true;
+}
+
 static void detect_gpu(LauncherApp &app) {
-    IDXGIFactory *fac = nullptr;
-    if (SUCCEEDED(CreateDXGIFactory(__uuidof(IDXGIFactory), (void **)&fac)) && fac) {
-        IDXGIAdapter *best = nullptr;
+    IDXGIFactory1 *fac = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&fac)) && fac) {
+        IDXGIAdapter1 *best = nullptr;
         SIZE_T best_vram = 0;
         for (UINT i = 0; ; i++) {
-            IDXGIAdapter *ad = nullptr;
-            if (fac->EnumAdapters(i, &ad) == DXGI_ERROR_NOT_FOUND) break;
-            DXGI_ADAPTER_DESC desc{};
-            if (SUCCEEDED(ad->GetDesc(&desc))) {
-                if (desc.DedicatedVideoMemory >= best_vram) {
+            IDXGIAdapter1 *ad = nullptr;
+            if (fac->EnumAdapters1(i, &ad) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_ADAPTER_DESC1 desc{};
+            if (SUCCEEDED(ad->GetDesc1(&desc))) {
+                if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
+                    ad->Release();
+                    continue;
+                }
+                if (!best || desc.DedicatedVideoMemory > best_vram) {
                     if (best) best->Release();
                     best = ad;
                     best_vram = desc.DedicatedVideoMemory;
@@ -176,14 +304,14 @@ static void detect_gpu(LauncherApp &app) {
             ad->Release();
         }
         if (best) {
-            DXGI_ADAPTER_DESC desc{};
-            if (SUCCEEDED(best->GetDesc(&desc))) {
+            DXGI_ADAPTER_DESC1 desc{};
+            if (SUCCEEDED(best->GetDesc1(&desc))) {
                 double gb = (double)desc.DedicatedVideoMemory / (1024.0 * 1024.0 * 1024.0);
                 wchar_t buf[256];
                 swprintf_s(buf, L"%s (%.1f GB VRAM)", desc.Description, gb);
                 app.gpu_name = buf;
-                // Recommend BC7 cache automatically on <= 12 GB VRAM GPUs
-                app.opt_bc7 = (gb > 0.5 && gb <= 12.5);
+                // Recommend BC7 cache automatically on <= 12 GB VRAM hardware GPUs (including low-VRAM / iGPUs)
+                app.opt_bc7 = (gb <= 12.5);
             }
             best->Release();
         }
@@ -192,16 +320,14 @@ static void detect_gpu(LauncherApp &app) {
 }
 
 static void refresh_install_state(LauncherApp &app) {
-    bool installed =
+    const bool installed =
         file_exists(app.install_root + L"\\data\\install.seal") &&
         file_exists(app.install_root + L"\\bin\\game.dll") &&
         file_exists(app.install_root + L"\\data\\game.romfs");
-    app.has_bc7 = dir_exists(app.install_root + L"\\bc7cache");
-    if (!app.worker_running.load()) {
-        app.mode = installed ? UiMode::Hub : UiMode::Setup;
-    }
+    const bool has_bc7 = file_exists(app.install_root + L"\\bc7cache\\bc7cache.idx");
 
-    // Parse active settings summary from save\lantern-settings.ini
+    // Parse active settings summary from save\lantern-settings.ini (outside app.mtx)
+    std::wstring summary = L"Upscaler: Auto (DLSS / FSR)  |  Output: Native Display";
     std::wstring ini = app.install_root + L"\\save\\lantern-settings.ini";
     FILE *f = _wfopen(ini.c_str(), L"rb");
     if (f) {
@@ -227,9 +353,15 @@ static void refresh_install_state(LauncherApp &app) {
         std::string s = "Upscaler: " + (up.empty() ? "auto" : up);
         if (!fg.empty() && fg != "off") s += "  |  Frame Gen: " + fg;
         if (!out.empty()) s += "  |  Output: " + out;
-        app.settings_summary = utf8_to_w(s);
-    } else {
-        app.settings_summary = L"Upscaler: Auto (DLSS / FSR)  |  Output: Native Display";
+        summary = utf8_to_w(s);
+    }
+
+    std::lock_guard<std::mutex> lk(app.mtx);
+    app.is_installed = installed;
+    app.has_bc7 = has_bc7;
+    app.settings_summary = std::move(summary);
+    if (!app.worker_running.load()) {
+        app.mode = (installed && !app.force_setup) ? UiMode::Hub : UiMode::Setup;
     }
 }
 
@@ -256,7 +388,7 @@ static bool run_nup_tool(const std::wstring &install_root, const std::wstring &s
     SetHandleInformation(hOutR, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(hErrR, HANDLE_FLAG_INHERIT, 0);
 
-    std::wstring cmd = L"\"" + exe + L"\" " + subcmd + L" \"" + target_path + L"\"";
+    std::wstring cmd = quote_arg(exe) + L" " + subcmd + L" " + quote_arg(target_path);
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
@@ -403,7 +535,7 @@ struct WinSha256 {
 static bool find_or_download_toolchain(LauncherApp &app, std::wstring &out_tc_dir, std::wstring &out_err) {
     // 1. Check local portable toolchain beside Launcher.exe first (instant offline path)
     std::wstring local_tc = app.install_root + L"\\toolchain";
-    if (file_exists(local_tc + L"\\bin\\clang-cl.exe") && file_exists(local_tc + L"\\bin\\lld-link.exe")) {
+    if (toolchain_valid(local_tc)) {
         out_tc_dir = local_tc;
         return true;
     }
@@ -416,7 +548,7 @@ static bool find_or_download_toolchain(LauncherApp &app, std::wstring &out_tc_di
     }
     std::wstring cache_root = std::wstring(local_app) + L"\\DarkEmblem";
     std::wstring cache_tc = cache_root + L"\\toolchain";
-    if (file_exists(cache_tc + L"\\bin\\clang-cl.exe") && file_exists(cache_tc + L"\\bin\\lld-link.exe")) {
+    if (toolchain_valid(cache_tc)) {
         out_tc_dir = cache_tc;
         return true;
     }
@@ -507,14 +639,15 @@ static bool find_or_download_toolchain(LauncherApp &app, std::wstring &out_tc_di
     if (hConn) WinHttpCloseHandle(hConn);
     WinHttpCloseHandle(hSess);
 
-    if (app.cancel_req.load()) { out_err = L"Cancelled by user."; return false; }
+    if (app.cancel_req.load()) { DeleteFileW(zip_path.c_str()); out_err = L"Cancelled by user."; return false; }
     if (!dl_ok) {
+        DeleteFileW(zip_path.c_str());
         if (out_err.empty())
             out_err = L"Could not download portable LLVM toolchain. Place toolchain-win64.zip extracted under .\\toolchain\\ or check your internet connection.";
         return false;
     }
 
-    // Extract zip via Windows built-in tar.exe (ships on all Win10 1803+ / Win11)
+    // Extract zip via Windows System32\tar.exe (never bare tar.exe which can hit Git Bash GNU tar)
     {
         std::lock_guard<std::mutex> lk(app.mtx);
         app.progress_stage = L"Extracting Compiler";
@@ -522,22 +655,79 @@ static bool find_or_download_toolchain(LauncherApp &app, std::wstring &out_tc_di
     }
     PostMessageW(app.hwnd, WM_APP_STATE_UPDATE, 0, 0);
 
-    CreateDirectoryW(cache_tc.c_str(), NULL);
-    std::wstring cmd = L"tar.exe -xf \"" + zip_path + L"\" -C \"" + cache_tc + L"\"";
-    STARTUPINFOW si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(NULL, cmd.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        out_err = L"Failed to unpack portable LLVM archive.";
+    wchar_t sysdir[MAX_PATH * 2] = {};
+    UINT sdlen = GetSystemDirectoryW(sysdir, (UINT)(sizeof(sysdir) / sizeof(sysdir[0])));
+    if (sdlen == 0 || sdlen >= (sizeof(sysdir) / sizeof(sysdir[0]))) {
+        DeleteFileW(zip_path.c_str());
+        out_err = L"Unable to locate Windows System32 directory.";
         return false;
     }
+    std::wstring tar_exe = std::wstring(sysdir) + L"\\tar.exe";
+    if (!file_exists(tar_exe)) {
+        DeleteFileW(zip_path.c_str());
+        out_err = L"Windows System32\\tar.exe not found (requires Windows 10 1803+ or Windows 11).";
+        return false;
+    }
+
+    std::wstring tmp_tc = cache_tc + L".tmp";
+    remove_dir_recursive(tmp_tc);
+    if (!CreateDirectoryW(tmp_tc.c_str(), NULL)) {
+        DeleteFileW(zip_path.c_str());
+        out_err = L"Failed to create temporary toolchain extraction folder.";
+        return false;
+    }
+
+    std::wstring cmd = quote_arg(tar_exe) + L" -xf " + quote_arg(zip_path) + L" -C " + quote_arg(tmp_tc);
+    STARTUPINFOW si{}; si.cb = sizeof(si); si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(tar_exe.c_str(), cmd.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
+                        NULL, NULL, &si, &pi)) {
+        remove_dir_recursive(tmp_tc);
+        DeleteFileW(zip_path.c_str());
+        out_err = L"Failed to launch System32\\tar.exe to unpack portable LLVM archive.";
+        return false;
+    }
+    HANDLE job = create_kill_job();
+    if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
+        CloseHandle(job);
+        job = NULL;
+    }
+    {
+        std::lock_guard<std::mutex> lk(app.mtx);
+        app.child_proc = pi.hProcess;
+        app.child_job = job;
+    }
+    ResumeThread(pi.hThread);
     WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD rc = 1;
     GetExitCodeProcess(pi.hProcess, &rc);
+    {
+        std::lock_guard<std::mutex> lk(app.mtx);
+        app.child_proc = NULL;
+        if (app.child_job && app.child_job == job) {
+            CloseHandle(app.child_job);
+            app.child_job = NULL;
+        }
+    }
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     DeleteFileW(zip_path.c_str());
 
-    if (rc != 0 || !file_exists(cache_tc + L"\\bin\\clang-cl.exe")) {
-        out_err = L"Portable LLVM extraction failed.";
+    if (app.cancel_req.load()) {
+        remove_dir_recursive(tmp_tc);
+        out_err = L"Cancelled by user.";
+        return false;
+    }
+    if (rc != 0 || !toolchain_valid(tmp_tc)) {
+        remove_dir_recursive(tmp_tc);
+        out_err = L"Portable LLVM extraction failed or archive is incomplete.";
+        return false;
+    }
+
+    // Atomically move validated temp directory into final cache_tc
+    remove_dir_recursive(cache_tc);
+    if (!MoveFileW(tmp_tc.c_str(), cache_tc.c_str()) || !toolchain_valid(cache_tc)) {
+        remove_dir_recursive(tmp_tc);
+        out_err = L"Failed to finalize portable LLVM toolchain directory.";
         return false;
     }
     out_tc_dir = cache_tc;
@@ -566,8 +756,11 @@ static void run_recompiler_async(LauncherApp &app, const std::wstring &mode_arg,
     std::thread([&app, mode_arg, need_toolchain, input_copy, bc7_copy]() {
         std::wstring tc_dir, err;
         if (need_toolchain && !find_or_download_toolchain(app, tc_dir, err)) {
-            std::lock_guard<std::mutex> lk(app.mtx);
-            app.last_error = err;
+            {
+                std::lock_guard<std::mutex> lk(app.mtx);
+                app.last_error = err;
+                if (app.cancel_req.load()) app.force_setup = false;
+            }
             app.worker_running.store(false);
             refresh_install_state(app);
             PostMessageW(app.hwnd, WM_APP_STATE_UPDATE, 0, 0);
@@ -576,19 +769,16 @@ static void run_recompiler_async(LauncherApp &app, const std::wstring &mode_arg,
 
         std::wstring recomp = app.install_root + L"\\bin\\recompiler.exe";
         if (!file_exists(recomp)) {
-            std::lock_guard<std::mutex> lk(app.mtx);
-            app.last_error = L"Missing bin\\recompiler.exe. Please re-extract the official release archive.";
+            {
+                std::lock_guard<std::mutex> lk(app.mtx);
+                app.last_error = L"Missing bin\\recompiler.exe. Please re-extract the official release archive.";
+            }
             app.worker_running.store(false);
             refresh_install_state(app);
             PostMessageW(app.hwnd, WM_APP_STATE_UPDATE, 0, 0);
             return;
         }
 
-        auto quote_arg = [](std::wstring s) -> std::wstring {
-            while (s.size() > 3 && (s.back() == L'\\' || s.back() == L'/')) s.pop_back();
-            if (!s.empty() && s.back() == L'\\') s.push_back(L'\\'); // escape drive-root trailing backslash before closing quote
-            return L"\"" + s + L"\"";
-        };
         std::wstring cmd = quote_arg(recomp) + L" --mode " + mode_arg +
                            L" --install-root " + quote_arg(app.install_root);
         if (mode_arg == L"install") {
@@ -608,56 +798,87 @@ static void run_recompiler_async(LauncherApp &app, const std::wstring &mode_arg,
         si.wShowWindow = SW_HIDE;
         PROCESS_INFORMATION pi{};
 
-        if (!CreateProcessW(NULL, cmd.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL,
+        if (!CreateProcessW(NULL, cmd.data(), NULL, NULL, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED, NULL,
                             app.install_root.c_str(), &si, &pi)) {
             CloseHandle(hRead); CloseHandle(hWrite);
-            std::lock_guard<std::mutex> lk(app.mtx);
-            app.last_error = L"Failed to start bin\\recompiler.exe.";
+            {
+                std::lock_guard<std::mutex> lk(app.mtx);
+                app.last_error = L"Failed to start bin\\recompiler.exe.";
+            }
             app.worker_running.store(false);
             refresh_install_state(app);
             PostMessageW(app.hwnd, WM_APP_STATE_UPDATE, 0, 0);
             return;
         }
         CloseHandle(hWrite);
+        HANDLE job = create_kill_job();
+        if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
+            CloseHandle(job);
+            job = NULL;
+        }
         {
             std::lock_guard<std::mutex> lk(app.mtx);
             app.child_proc = pi.hProcess;
+            app.child_job = job;
         }
+        ResumeThread(pi.hThread);
 
-        std::string line_buf, err_msg, last_line, full_log;
+        static constexpr size_t kLogHeadMax = 32 * 1024;
+        static constexpr size_t kLogTailMax = 256 * 1024;
+        std::string line_buf, err_msg, last_line, log_head, log_tail;
+        bool log_truncated = false;
+        auto process_line = [&](std::string line) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+            if (line.rfind("PROGRESS ", 0) == 0) {
+                const char *p = line.c_str() + 9;
+                int pct = atoi(p);
+                const char *sp = strchr(p, ' ');
+                std::string rest = sp ? (sp + 1) : "";
+                size_t bar = rest.find(" | ");
+                std::string st = (bar != std::string::npos) ? rest.substr(0, bar) : rest;
+                std::string det = (bar != std::string::npos) ? rest.substr(bar + 3) : "";
+                {
+                    std::lock_guard<std::mutex> lk(app.mtx);
+                    app.progress_pct = std::max(0, std::min(100, pct));
+                    app.progress_stage = utf8_to_w(st);
+                    app.progress_detail = utf8_to_w(det);
+                }
+                PostMessageW(app.hwnd, WM_APP_STATE_UPDATE, 0, 0);
+            } else if (line.rfind("ERROR ", 0) == 0) {
+                err_msg = line.substr(6);
+            } else if (!line.empty()) {
+                last_line = line;
+            }
+        };
+
         char chunk[2048];
         DWORD got = 0;
         while (ReadFile(hRead, chunk, sizeof(chunk) - 1, &got, NULL) && got > 0) {
             chunk[got] = 0;
-            if (full_log.size() < 256 * 1024) full_log.append(chunk, got);
+            size_t off = 0;
+            if (log_head.size() < kLogHeadMax) {
+                size_t take = std::min<size_t>(got, kLogHeadMax - log_head.size());
+                log_head.append(chunk, take);
+                off = take;
+            }
+            if (off < (size_t)got) {
+                log_tail.append(chunk + off, (size_t)got - off);
+                if (log_tail.size() > kLogTailMax) {
+                    log_tail.erase(0, log_tail.size() - kLogTailMax);
+                    log_truncated = true;
+                }
+            }
             line_buf.append(chunk, got);
             size_t nl;
             while ((nl = line_buf.find('\n')) != std::string::npos) {
                 std::string line = line_buf.substr(0, nl);
                 line_buf.erase(0, nl + 1);
-                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-                if (line.rfind("PROGRESS ", 0) == 0) {
-                    int pct = 0;
-                    const char *p = line.c_str() + 9;
-                    pct = atoi(p);
-                    const char *sp = strchr(p, ' ');
-                    std::string rest = sp ? (sp + 1) : "";
-                    size_t bar = rest.find(" | ");
-                    std::string st = (bar != std::string::npos) ? rest.substr(0, bar) : rest;
-                    std::string det = (bar != std::string::npos) ? rest.substr(bar + 3) : "";
-                    {
-                        std::lock_guard<std::mutex> lk(app.mtx);
-                        app.progress_pct = std::max(0, std::min(100, pct));
-                        app.progress_stage = utf8_to_w(st);
-                        app.progress_detail = utf8_to_w(det);
-                    }
-                    PostMessageW(app.hwnd, WM_APP_STATE_UPDATE, 0, 0);
-                } else if (line.rfind("ERROR ", 0) == 0) {
-                    err_msg = line.substr(6);
-                } else if (!line.empty()) {
-                    last_line = line;
-                }
+                process_line(std::move(line));
             }
+        }
+        if (!line_buf.empty()) {
+            process_line(std::move(line_buf));
+            line_buf.clear();
         }
         CloseHandle(hRead);
         WaitForSingleObject(pi.hProcess, INFINITE);
@@ -670,20 +891,32 @@ static void run_recompiler_async(LauncherApp &app, const std::wstring &mode_arg,
                 char hdr[256];
                 snprintf(hdr, sizeof(hdr), "exit_code=%lu (0x%08lX)\r\n", (unsigned long)rc, (unsigned long)rc);
                 fwrite(hdr, 1, strlen(hdr), lf);
-                if (!full_log.empty()) fwrite(full_log.data(), 1, full_log.size(), lf);
+                if (!log_head.empty()) fwrite(log_head.data(), 1, log_head.size(), lf);
+                if (log_truncated) {
+                    static const char kMid[] = "\r\n... [middle output truncated to preserve error tail] ...\r\n";
+                    fwrite(kMid, 1, sizeof(kMid) - 1, lf);
+                }
+                if (!log_tail.empty()) fwrite(log_tail.data(), 1, log_tail.size(), lf);
                 fclose(lf);
             }
         }
         {
             std::lock_guard<std::mutex> lk(app.mtx);
             app.child_proc = NULL;
+            if (app.child_job && app.child_job == job) {
+                CloseHandle(app.child_job);
+                app.child_job = NULL;
+            }
             if (app.cancel_req.load()) {
                 app.last_error = L"Operation cancelled.";
+                app.force_setup = false;
             } else if (rc != 0) {
                 char fallback[160];
                 snprintf(fallback, sizeof(fallback), "Setup failed (exit 0x%08lX). Check setup.log and antivirus/free space.", (unsigned long)rc);
                 std::string shown = !err_msg.empty() ? err_msg : (!last_line.empty() ? last_line : fallback);
                 app.last_error = utf8_to_w(shown);
+            } else if (mode_arg == L"install") {
+                app.force_setup = false;
             }
         }
         CloseHandle(pi.hThread);
@@ -703,7 +936,7 @@ static std::wstring pick_nup_file(HWND owner) {
     ofn.lpstrFilter = L"Switch 2 NUP Backup (*.nup)\0*.nup\0All Files (*.*)\0*.*\0";
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH * 2;
-    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
     ofn.lpstrTitle = L"Select Switch 2 .nup Backup";
     if (GetOpenFileNameW(&ofn)) return file;
     return L"";
@@ -760,6 +993,44 @@ static void draw_button(LauncherApp &app, ID2D1SolidColorBrush *br, int id, Rect
     app.rt->DrawText(label, (UINT32)wcslen(label), tf, rc.d2d(), br);
 }
 
+static void draw_error_banner(LauncherApp &app, ID2D1SolidColorBrush *br, RectF box, const std::wstring &err) {
+    if (err.empty()) return;
+    br->SetColor(hex_col(0x2A1419));
+    app.rt->FillRoundedRectangle(box.rr(6.0f), br);
+    br->SetColor(hex_col(0xC93B4B, 0.65f));
+    app.rt->DrawRoundedRectangle(box.rr(6.0f), br, 1.0f);
+
+    RectF tr{ box.x + 10.0f, box.y + 5.0f, std::max(10.0f, box.w - 20.0f), std::max(10.0f, box.h - 10.0f) };
+    IDWriteTextFormat *fmt = app.tf_err ? app.tf_err : app.tf_small;
+    std::wstring shown = err;
+
+    auto fits = [&](const std::wstring &s) -> bool {
+        if (!app.dw_factory || !fmt) return true;
+        IDWriteTextLayout *tl = nullptr;
+        if (FAILED(app.dw_factory->CreateTextLayout(s.c_str(), (UINT32)s.size(), fmt, tr.w, tr.h, &tl)) || !tl)
+            return true;
+        DWRITE_TEXT_METRICS tm{};
+        bool ok = SUCCEEDED(tl->GetMetrics(&tm)) ? (tm.height <= tr.h + 0.5f) : true;
+        tl->Release();
+        return ok;
+    };
+
+    if (!fits(shown)) {
+        const std::wstring suffix = (shown.find(L"setup.log") == std::wstring::npos) ? L"… (see setup.log)" : L"…";
+        size_t lo = 0, hi = shown.size();
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo + 1) / 2;
+            if (fits(shown.substr(0, mid) + suffix)) lo = mid;
+            else hi = mid - 1;
+        }
+        while (lo > 0 && (shown[lo - 1] == L' ' || shown[lo - 1] == L'\t')) lo--;
+        shown = shown.substr(0, lo) + suffix;
+    }
+
+    br->SetColor(hex_col(0xF07B86));
+    app.rt->DrawText(shown.c_str(), (UINT32)shown.size(), fmt, tr.d2d(), br, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+}
+
 static void render_app(LauncherApp &app) {
     if (!app.rt) {
         RECT cr{}; GetClientRect(app.hwnd, &cr);
@@ -814,10 +1085,12 @@ static void render_app(LauncherApp &app) {
     app.rt->DrawText(sub.c_str(), (UINT32)sub.size(), app.tf_sub,
                      D2D1::RectF(106, 66, W - 36, 94), br);
 
-    // Lock snapshot of state
+    // Lock snapshot of state (avoid data races with background worker thread)
     UiMode cur_mode;
     int pct;
-    std::wstring stage, detail, err;
+    std::wstring stage, detail, err, settings_summary;
+    bool has_bc7 = false, force_setup = false, is_installed = false;
+    uint64_t install_start_ms = 0;
     {
         std::lock_guard<std::mutex> lk(app.mtx);
         cur_mode = app.mode;
@@ -825,6 +1098,11 @@ static void render_app(LauncherApp &app) {
         stage = app.progress_stage;
         detail = app.progress_detail;
         err = app.last_error;
+        settings_summary = app.settings_summary;
+        has_bc7 = app.has_bc7;
+        force_setup = app.force_setup;
+        is_installed = app.is_installed;
+        install_start_ms = app.install_start_ms;
     }
 
     if (cur_mode == UiMode::Setup) {
@@ -880,18 +1158,19 @@ static void render_app(LauncherApp &app) {
             app.rt->DrawText(L"✓", 1, app.tf_btn, box.d2d(), br);
         }
         br->SetColor(hex_col(0xD2D8E4));
-        const wchar_t *bc7_lbl = L"Build BC7 Texture Cache (saves 2–4 GB VRAM on 8–12 GB GPUs; +3 min)";
+        const wchar_t *bc7_lbl = L"Build BC7 Texture Cache (saves 2–4 GB VRAM on 6–12 GB GPUs; +3 min)";
         app.rt->DrawText(bc7_lbl, (UINT32)wcslen(bc7_lbl), app.tf_body, D2D1::RectF(66, 434, W - 36, 460), br);
 
         if (!err.empty()) {
-            br->SetColor(hex_col(0xE05A68));
-            app.rt->DrawText(err.c_str(), (UINT32)err.size(), app.tf_small,
-                             D2D1::RectF(36, 470, W - 36, 502), br);
+            draw_error_banner(app, br, { 36, 466, W - 72, 48 }, err);
         }
 
         draw_button(app, br, BTN_START_INSTALL, { W - 296, H - 76, 260, 48 },
                     L"INSTALL & RECOMPILE", true, app.input_valid, true);
         draw_button(app, br, BTN_NOTICES, { 36, H - 68, 170, 36 }, L"Third-Party Notices", false, true);
+        if (force_setup && is_installed) {
+            draw_button(app, br, BTN_BACK_HUB, { 218, H - 68, 128, 36 }, L"Back to Hub", false, true);
+        }
 
     } else if (cur_mode == UiMode::Installing) {
         // ---- INSTALLING / RECOMPILING VIEW ----
@@ -906,8 +1185,8 @@ static void render_app(LauncherApp &app) {
         app.rt->DrawText(hdr.c_str(), (UINT32)hdr.size(), app.tf_title, D2D1::RectF(64, 192, W - 210, 228), br);
 
         // Live elapsed timer (updates every 500ms so user always sees active progress)
-        if (app.install_start_ms > 0) {
-            uint64_t sec = (GetTickCount64() - app.install_start_ms) / 1000ull;
+        if (install_start_ms > 0) {
+            uint64_t sec = (GetTickCount64() - install_start_ms) / 1000ull;
             wchar_t tbuf[64];
             swprintf_s(tbuf, L"Elapsed %02llu:%02llu", (unsigned long long)(sec / 60ull), (unsigned long long)(sec % 60ull));
             br->SetColor(hex_col(0x8D96AA));
@@ -958,7 +1237,7 @@ static void render_app(LauncherApp &app) {
         app.rt->DrawText(ver, (UINT32)wcslen(ver), app.tf_head, D2D1::RectF(60, 194, 520, 224), br);
 
         br->SetColor(hex_col(0x9EA7BA));
-        app.rt->DrawText(app.settings_summary.c_str(), (UINT32)app.settings_summary.size(), app.tf_body,
+        app.rt->DrawText(settings_summary.c_str(), (UINT32)settings_summary.size(), app.tf_body,
                          D2D1::RectF(60, 232, 540, 266), br);
 
         draw_button(app, br, BTN_PLAY, { W - 266, 186, 206, 62 }, L"▶  PLAY", true, true, true);
@@ -968,13 +1247,11 @@ static void render_app(LauncherApp &app) {
         draw_button(app, br, BTN_SETTINGS,        { gx,           gy,      gw, gh }, L"Graphics & Upscaler Settings", false, true);
         draw_button(app, br, BTN_REBUILD_SHADERS, { gx + gw + 18, gy,      gw, gh }, L"Rebuild GPU Shader Cache",     false, true);
         draw_button(app, br, BTN_BUILD_BC7,       { gx,           gy + 84, gw, gh },
-                    app.has_bc7 ? L"Rebuild BC7 Texture Cache (Installed)" : L"Build BC7 Texture Cache (Save VRAM)", false, true);
+                    has_bc7 ? L"Rebuild BC7 Texture Cache (Installed)" : L"Build BC7 Texture Cache (Save VRAM)", false, true);
         draw_button(app, br, BTN_OPEN_SAVE,       { gx + gw + 18, gy + 84, gw, gh }, L"Open Save Data Folder",        false, true);
 
         if (!err.empty()) {
-            br->SetColor(hex_col(0xE05A68));
-            app.rt->DrawText(err.c_str(), (UINT32)err.size(), app.tf_small,
-                             D2D1::RectF(36, 488, W - 36, 514), br);
+            draw_error_banner(app, br, { 36, 486, W - 72, 36 }, err);
         }
 
         draw_button(app, br, BTN_REINSTALL, { 36, H - 64, 195, 36 }, L"Reinstall / Change Backup", false, true);
@@ -1005,14 +1282,32 @@ static void handle_click(LauncherApp &app, int id) {
             InvalidateRect(app.hwnd, NULL, FALSE);
             break;
         case BTN_START_INSTALL:
-            if (app.input_valid) run_recompiler_async(app, L"install", true);
+            if (app.input_valid) {
+                std::wstring pf_err;
+                if (!preflight_check(app, pf_err)) {
+                    {
+                        std::lock_guard<std::mutex> lk(app.mtx);
+                        app.last_error = pf_err;
+                    }
+                    InvalidateRect(app.hwnd, NULL, FALSE);
+                } else {
+                    run_recompiler_async(app, L"install", true);
+                }
+            }
             break;
-        case BTN_CANCEL_INSTALL: {
+        case BTN_CANCEL_INSTALL:
             app.cancel_req.store(true);
-            std::lock_guard<std::mutex> lk(app.mtx);
-            if (app.child_proc) TerminateProcess(app.child_proc, 1);
+            terminate_active_children(app);
             break;
-        }
+        case BTN_BACK_HUB:
+            {
+                std::lock_guard<std::mutex> lk(app.mtx);
+                app.force_setup = false;
+                app.last_error.clear();
+            }
+            refresh_install_state(app);
+            InvalidateRect(app.hwnd, NULL, FALSE);
+            break;
         case BTN_PLAY: {
             std::wstring exe = app.install_root + L"\\Play.exe";
             ShellExecuteW(app.hwnd, L"open", exe.c_str(), NULL, app.install_root.c_str(), SW_SHOWNORMAL);
@@ -1036,13 +1331,31 @@ static void handle_click(LauncherApp &app, int id) {
             break;
         }
         case BTN_REINSTALL:
-            app.mode = UiMode::Setup;
+            {
+                std::lock_guard<std::mutex> lk(app.mtx);
+                app.force_setup = true;
+                app.mode = UiMode::Setup;
+                app.last_error.clear();
+            }
             InvalidateRect(app.hwnd, NULL, FALSE);
             break;
         case BTN_NOTICES: {
             std::wstring p = app.install_root + L"\\THIRD_PARTY_NOTICES.txt";
             ShellExecuteW(app.hwnd, L"open", p.c_str(), NULL, app.install_root.c_str(), SW_SHOWNORMAL);
             break;
+        }
+    }
+}
+
+static void client_px_to_dip(const LauncherApp &app, LPARAM lp, float &x, float &y) {
+    x = (float)GET_X_LPARAM(lp);
+    y = (float)GET_Y_LPARAM(lp);
+    if (app.rt) {
+        FLOAT dpiX = 96.0f, dpiY = 96.0f;
+        app.rt->GetDpi(&dpiX, &dpiY);
+        if (dpiX > 0.0f && dpiY > 0.0f) {
+            x *= 96.0f / dpiX;
+            y *= 96.0f / dpiY;
         }
     }
 }
@@ -1063,7 +1376,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case WM_MOUSEMOVE: {
-            float x = (float)GET_X_LPARAM(lp), y = (float)GET_Y_LPARAM(lp);
+            float x = 0.0f, y = 0.0f;
+            client_px_to_dip(g_app, lp, x, y);
             int hit = -1;
             for (const auto &b : g_app.btns) if (b.rc.hit(x, y)) { hit = b.id; break; }
             if (hit != g_app.hover_id) {
@@ -1074,7 +1388,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_LBUTTONDOWN: {
-            float x = (float)GET_X_LPARAM(lp), y = (float)GET_Y_LPARAM(lp);
+            float x = 0.0f, y = 0.0f;
+            client_px_to_dip(g_app, lp, x, y);
             for (const auto &b : g_app.btns) {
                 if (b.rc.hit(x, y)) { handle_click(g_app, b.id); break; }
             }
@@ -1083,7 +1398,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DROPFILES: {
             HDROP hd = (HDROP)wp;
             wchar_t path[MAX_PATH * 2];
-            if (DragQueryFileW(hd, 0, path, MAX_PATH * 2) > 0 && g_app.mode == UiMode::Setup) {
+            UiMode cur_mode;
+            {
+                std::lock_guard<std::mutex> lk(g_app.mtx);
+                cur_mode = g_app.mode;
+            }
+            if (DragQueryFileW(hd, 0, path, MAX_PATH * 2) > 0 && cur_mode == UiMode::Setup) {
                 inspect_selected_backup(g_app, path);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
@@ -1110,7 +1430,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_app.worker_running.load()) KillTimer(hwnd, 1);
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
+        case WM_CLOSE:
+            g_app.cancel_req.store(true);
+            terminate_active_children(g_app);
+            DestroyWindow(hwnd);
+            return 0;
         case WM_DESTROY:
+            g_app.cancel_req.store(true);
+            terminate_active_children(g_app);
             PostQuitMessage(0);
             return 0;
     }
@@ -1151,6 +1478,20 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, LPWSTR cmd, int show) {
     mk_fmt(13.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER,  &g_app.tf_btn);
     mk_fmt(16.0f, DWRITE_FONT_WEIGHT_BOLD,     DWRITE_TEXT_ALIGNMENT_CENTER,  &g_app.tf_btn_big);
 
+    // Dedicated error text format: top-aligned, wrapped, with character-granularity ellipsis trimming
+    g_app.dw_factory->CreateTextFormat(L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                       DWRITE_FONT_STRETCH_NORMAL, 11.5f, L"en-us", &g_app.tf_err);
+    if (g_app.tf_err) {
+        g_app.tf_err->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        g_app.tf_err->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        g_app.tf_err->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        DWRITE_TRIMMING trim{ DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+        IDWriteInlineObject *ellipsis = nullptr;
+        g_app.dw_factory->CreateEllipsisTrimmingSign(g_app.tf_err, &ellipsis);
+        g_app.tf_err->SetTrimming(&trim, ellipsis);
+        if (ellipsis) ellipsis->Release();
+    }
+
     HICON hIco = LoadIconW(hi, MAKEINTRESOURCEW(1));
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -1184,6 +1525,10 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, LPWSTR cmd, int show) {
         DispatchMessageW(&m);
     }
 
+    auto rel_tf = [](IDWriteTextFormat *&p) { if (p) { p->Release(); p = nullptr; } };
+    rel_tf(g_app.tf_title); rel_tf(g_app.tf_sub); rel_tf(g_app.tf_head);
+    rel_tf(g_app.tf_body); rel_tf(g_app.tf_small); rel_tf(g_app.tf_err);
+    rel_tf(g_app.tf_btn); rel_tf(g_app.tf_btn_big);
     if (g_app.rt) g_app.rt->Release();
     if (g_app.d2d_factory) g_app.d2d_factory->Release();
     if (g_app.dw_factory) g_app.dw_factory->Release();

@@ -54,7 +54,7 @@
 
 ## Quick Start
 
-1. Download **`DarkEmblem-Setup-v1.1.1.zip`** from the [**Releases**](https://github.com/chivien99999/Dark-Emblem/releases/latest) page and extract it to a folder with at least **40 GB** of free disk space (for example `C:\Games\DarkEmblem`).
+1. Download **`DarkEmblem-Setup-v1.1.2.zip`** from the [**Releases**](https://github.com/chivien99999/Dark-Emblem/releases/latest) page and extract it to a folder with at least **40 GB** of free disk space (for example `C:\Games\DarkEmblem`).
 2. Double-click **`Launcher.exe`**.
 3. Drag and drop your own Switch 2 backup onto the launcher window (or click **Select .nup File...** / **Select exefs+romfs Folder...**).
 4. *(Optional)* Check **Build BC7 Texture Cache** if your GPU has 8–12 GB VRAM.
@@ -100,7 +100,7 @@ Dark Emblem accepts standard Switch 2 backup formats (`v1.2.0 / 131072`, base + 
 ## License, Security Verification & Third-Party Software
 
 ### Open-Auditable Front-End (`apps/`)
-The complete source code for all three desktop applications you run directly — **`Launcher.exe`** ([apps/launcher/launcher.cpp](apps/launcher/launcher.cpp)), **`Play.exe`** ([apps/play/play_stub.c](apps/play/play_stub.c)), and **`Settings.exe`** ([apps/settings/settings_app.c](apps/settings/settings_app.c)) — is published in this repository under a **Source-Available Audit & Personal Build License** ([LICENSE](LICENSE)) so anyone can inspect every network request (SHA-256 verified toolchain fetch), file access, and process launch, or build all three executables locally with zero external SDKs:
+The complete source code for all three desktop applications you run directly — **`Launcher.exe`**, **`Play.exe`**, and **`Settings.exe`** — is published in the repository under a **Source-Available Audit & Personal Build License** ([LICENSE](LICENSE)) so anyone can inspect every network request (SHA-256 verified toolchain fetch), file access, and process launch, or build all three executables locally with zero external SDKs:
 
 ```powershell
 cmake -S apps -B build-apps
