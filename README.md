@@ -54,7 +54,7 @@
 
 ## Quick Start
 
-1. Download **`DarkEmblem-Setup-v1.1.1.zip`** from the [**Releases**](https://github.com/chivien99999/Dark-Emblem/releases/latest) page and extract it to a folder with at least **40 GB** of free disk space (for example `C:\Games\DarkEmblem`).
+1. Download **`DarkEmblem-Setup-v1.1.0.zip`** from the [**Releases**](https://github.com/chivien99999/Dark-Emblem/releases/latest) page and extract it to a folder with at least **40 GB** of free disk space (for example `C:\Games\DarkEmblem`).
 2. Double-click **`Launcher.exe`**.
 3. Drag and drop your own Switch 2 backup onto the launcher window (or click **Select .nup File...** / **Select exefs+romfs Folder...**).
 4. *(Optional)* Check **Build BC7 Texture Cache** if your GPU has 8–12 GB VRAM.
